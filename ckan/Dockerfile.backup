@@ -1,0 +1,138 @@
+# Base image src: https://github.com/ckan/ckan-docker-base/blob/main/ckan-2.11/Dockerfile
+FROM ckan/ckan-base:2.11 AS builder
+
+# Install any extensions needed by your CKAN instance
+# See Dockerfile.dev for more details and examples
+
+# Copy custom initialization scripts
+COPY --chown=ckan-sys:ckan-sys docker-entrypoint.d/* /docker-entrypoint.d/
+
+# Apply any patches needed to CKAN core or any of the built extensions (not the
+# runtime mounted ones)
+COPY --chown=ckan-sys:ckan-sys patches ${APP_DIR}/patches
+
+USER ckan
+
+RUN for d in $APP_DIR/patches/*; do \
+        if [ -d $d ]; then \
+            for f in `ls $d/*.patch | sort -g`; do \
+                cd $SRC_DIR/`basename "$d"` && echo "$0: Applying patch $f to $SRC_DIR/`basename $d`"; patch -p1 < "$f" ; \
+            done ; \
+        fi ; \
+    done
+
+# -------------------------------
+# Stage 2: Wolfi runtime
+# -------------------------------
+FROM chainguard/wolfi-base:latest AS runtime
+
+# Install Python + system dependencies required by CKAN
+RUN apk update && apk add --no-cache \
+        bash \
+        shadow \
+        # python3=3.11* \
+        postgresql-client \
+        # py3-pip \
+        # postgresql-libs
+        libxml2 \
+        libxslt \
+        libffi \
+        zlib \
+        libmagic-dev \
+        # uwsgi \
+        # for python build
+        build-base \
+        libffi-dev \
+        libstdc++ \
+        gcc \
+        curl \
+        make \
+        zlib-dev \
+        bzip2-dev \
+        readline-dev \
+        sqlite-dev \
+        xz-dev \
+        tk-dev \
+        libssl3 \
+        openssl-dev \
+        wget
+
+ARG PYTHON_VERSION=3.10.10
+
+# Download and compile Python, then cleanup packages
+RUN wget https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz && \
+    tar -xvf Python-${PYTHON_VERSION}.tgz && \
+    cd Python-${PYTHON_VERSION} && \
+    ./configure --enable-optimizations && \
+    make && \
+    make install && \
+    apk del build-base openssl-dev zlib-dev bzip2-dev readline-dev \
+        sqlite-dev xz-dev tk-dev && \
+    rm -rf /Python-${PYTHON_VERSION}* /var/cache/apk/*
+
+# Install pip, upgrade base tools, and install packages in a stable, cached way
+RUN python3 -m ensurepip --upgrade && \
+    \
+    # Upgrade pip, setuptools, and wheel for modern package compatibility
+    python3 -m pip install --upgrade pip setuptools wheel && \
+    # \
+    # # Download all dependencies and their wheels locally to avoid future network access
+    # pip download --dest /tmp/wheels -r requirements.txt && \
+    # \
+    # # Install from the local wheel directory (fully offline, deterministic)
+    # pip install --no-cache-dir --no-index --find-links=/tmp/wheels -r requirements.txt
+    pip install python-magic
+
+# Set working directories
+ARG APP_DIR=/srv/app
+ARG SRC_DIR=/srv/app/src
+WORKDIR $APP_DIR
+
+# Copy Python environment from builder
+COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
+
+# Patch the copied python packages if needed (e.g. to fix vulnerabilities in dependencies)
+RUN pip install --upgrade urllib3>=2.6.3 wheel>=0.46.3
+
+# Create the 'ckan-sys' group and users 'ckan-sys' and 'ckan' with matching UID/GID
+RUN groupadd -g 502 ckan-sys && \
+    useradd -rm -d /srv/app -s /bin/bash -g ckan-sys -u 502 ckan-sys && \
+    useradd -rm -d /srv/app -s /bin/bash -g ckan-sys -u 503 ckan && \
+    # Create directories (to avoid chown errors)
+    mkdir -p /srv/app/src /srv/app/docker-entrypoint.d /srv/app/patches
+
+# Copy CKAN application from builder stage
+COPY --from=builder /docker-entrypoint.d $APP_DIR/docker-entrypoint.d
+# COPY --from=builder /srv/app/src $SRC_DIR
+# COPY --from=builder /srv/app/patches $APP_DIR/patches
+# COPY --from=builder /srv/app/start_ckan.sh $APP_DIR/start_ckan.sh
+# COPY --from=builder /srv/app/prerun.py $APP_DIR/prerun.py
+COPY --from=builder /srv/app $APP_DIR
+
+# Copy everything from /usr/local/bin in the builder stage to the runtime image
+COPY --from=builder /usr/local/bin/ckan /usr/local/bin/ckan
+COPY --from=builder /usr/local/bin/uwsgi /usr/local/bin/uwsgi
+
+# Copy the Python shared libraries from the builder stage to the runtime image
+COPY --from=builder /usr/local/lib/libpython3.10.so.1.0 /usr/local/lib/
+# COPY --from=builder /var/lib/ckan /var/lib/
+
+RUN mkdir -p /var/lib/ckan && chown ckan:ckan-sys /var/lib/ckan
+
+# Ensure the 'start_ckan.sh' script is executable and convert line endings
+RUN chmod +x /srv/app/start_ckan.sh
+
+
+USER ckan
+
+# Internals, you probably don't need to change these
+ENV TZ=UTC
+ENV APP_DIR=/srv/app
+ENV SRC_DIR=${APP_DIR}/src
+ENV CKAN_INI=${APP_DIR}/ckan.ini
+ENV PIP_SRC=${SRC_DIR}
+ENV CKAN_STORAGE_PATH=/var/lib/ckan
+ENV GIT_URL=https://github.com/ckan/ckan.git
+
+# Set entrypoint
+CMD ["/srv/app/start_ckan.sh"]
